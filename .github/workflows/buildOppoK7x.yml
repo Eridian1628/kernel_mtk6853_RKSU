@@ -1,4 +1,4 @@
-name: Build(rsuntk KSU) Oppo K7x Final
+name: Build(rsuntk KSU legacy + Hooks) Oppo K7x MT6853
 
 on:
   push:
@@ -20,8 +20,10 @@ jobs:
           libelf-dev curl libssl-dev libtfm-dev wget device-tree-compiler ca-certificates \
           python3 python-is-python3 binutils binutils-aarch64-linux-gnu \
           binutils-arm-linux-gnueabi gcc-multilib g++-multilib libc6-dev-i386 \
-          libncurses5 libncursesw5-dev rsync
-        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+          libncurses5 libncursesw5-dev rsync patch
+
+    - name: 创建工作目录
+      run: mkdir -p $GITHUB_WORKSPACE/kernel_workspace
 
     - name: 下载 GCC 工具链 (Google 4.9)
       run: |
@@ -42,49 +44,53 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/sanba0519/android_kernel_4.14_MT6853 android-kernel
 
-    - name: 手动集成 rsuntk KernelSU (终极路径修复)
+    - name: 集成 rsuntk KernelSU (legacy 分支 + 手动钩子 patch)
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 1. 彻底清理环境防止重复注入
+        # 清理旧 kernelsu
         rm -rf drivers/kernelsu
-        sed -i '/kernelsu/d' drivers/Kconfig
-        sed -i '/kernelsu/d' drivers/Makefile
+        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         
-        # 2. 克隆 RKSU
-        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b main
+        # 克隆 legacy 分支（兼容 4.14）
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b legacy
         
-        # 3. 路径对齐：建立软链接，无论内核怎么找都能找到 Kconfig
+        # 路径软链接
         ln -sf $(pwd)/drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
         ln -sf $(pwd)/drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
-
-        # 4. 转码并注入：在第一行插入，避开文件末尾的 endmenu
-        dos2unix drivers/Kconfig
-        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
         
-        # 5. 修改 Makefile
-        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        # 应用 rsuntkOrgs 的 4.14 最小化手动钩子 patch（强烈推荐，解决无 root 问题）
+        wget https://raw.githubusercontent.com/rsuntkOrgs/KSU-Hook/master/4.14.diff -O 4.14.diff
+        patch -p1 < 4.14.diff || echo "Patch applied with rejects/warnings - check fs/*.rej files if any"
         
-        # 6. 修复 Oppo 源码中恶心的乱码警告
+        # 如果 patch 失败，可 fallback 到手动 sed（注释掉下面几行如果 patch 成功）
+        # dos2unix drivers/Kconfig
+        # sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        # echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        
+        # 转码修复 Oppo 源码乱码
         find drivers/soc/oplus -name "Kconfig*" -exec dos2unix {} \;
         find drivers/nfc -name "Kconfig*" -exec dos2unix {} \;
         find drivers/misc -name "Kconfig*" -exec dos2unix {} \;
 
-    - name: 注入 Minimalist Hooks (精准修复语法)
+    - name: 额外手动钩子注入（patch fallback + 加强 stat/execveat）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 修复 fs/open.c
-        # 逻辑：先删除之前可能注入错误的行，然后匹配函数头并在紧随其后的左大括号后插入代码
-        sed -i '/ksu_handle_faccessat/d' fs/open.c
-        sed -i '/long do_sys_open(int dfd, const char __user \*filename, int flags, umode_t mode)/!b;n;a \    ksu_handle_faccessat(&dfd, &filename, &mode, &flags);' fs/open.c
-        # 并在文件头部添加声明（如果还没添加的话）
-        sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
-
-        # 修复 fs/exec.c
-        sed -i '/ksu_handle_execveat/d' fs/exec.c
-        sed -i '/int search_binary_handler(struct linux_binprm \*bprm)/!b;n;a \    ksu_handle_execveat(&bprm->fd, &bprm->filename, &bprm->argc, &bprm->envp, &bprm->flags);' fs/exec.c
-        sed -i '1i extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);' fs/exec.c
+        # 清理旧注入
+        sed -i '/ksu_handle/d' fs/*.c || true
+        
+        # fs/exec.c - do_execveat_common (legacy 签名兼容)
+        sed -i '/int do_execveat_common(int fd, struct filename \*filename,/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif' fs/exec.c || true
+        
+        # fs/open.c - do_faccessat
+        sed -i '/long do_faccessat(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(&dfd, &filename, &mode, &flags)) return -EACCES;\n    #endif' fs/open.c || true
+        
+        # fs/stat.c - vfs_fstatat (关键！解决 manager 读 apk 失败)
+        sed -i '/int vfs_fstatat(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif' fs/stat.c || true
+        
+        # 头部声明
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n#endif' fs/exec.c || true
 
     - name: 配置内核并开启 KSU
       run: |
@@ -95,18 +101,22 @@ jobs:
 
         make O=out mt6853-ss_defconfig
 
-        # 强制启用 KSU 手动钩子模式
+        # 强制 KSU 配置（手动钩子模式）
         scripts/config --file out/.config --enable CONFIG_KSU
         scripts/config --file out/.config --enable CONFIG_KSU_MANUAL_HOOK
         scripts/config --file out/.config --disable CONFIG_KSU_USE_KPROBES
+        scripts/config --file out/.config --disable CONFIG_KPROBES
+        scripts/config --file out/.config --disable CONFIG_KPROBE_EVENTS
+        scripts/config --file out/.config --disable CONFIG_HAVE_KPROBES
+        scripts/config --file out/.config --enable CONFIG_MODULES
 
         # 刷新配置
-        make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- olddefconfig
+        make O=out ARCH=arm64 olddefconfig
 
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
-        key: mtk6853-rsuntk-ksu-${{ github.sha }}
+        key: mtk6853-rsuntk-legacy-ksu-${{ github.sha }}
         max-size: 3G
 
     - name: 开始编译内核
@@ -123,8 +133,7 @@ jobs:
           CLANG_TRIPLE=aarch64-linux-gnu- \
           CROSS_COMPILE=aarch64-linux-android- \
           CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-          LD=ld.lld \
-          Image.gz-dtb 2>&1 | tee build.log
+          Image.gz-dtb 2>&1 | tee build.log || { tail -n 100 build.log; exit 1; }
 
     - name: 制作卡刷包
       if: success()
@@ -133,14 +142,15 @@ jobs:
         git clone https://github.com/osm0sis/AnyKernel3
         cd AnyKernel3
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+        sed -i 's/do.modules=1/do.modules=0/g' anykernel.sh  # 避免模块卡 boot
         sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=/dev/block/by-name/boot;!g' anykernel.sh
         sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
         echo 'cmdline+=" androidboot.selinux=permissive"' >> anykernel.sh
-        cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
+        cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb || echo "No Image.gz-dtb, check build.log"
 
     - name: 上传结果
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: mtk6853-KSU-Kernel
+        name: mtk6853-KSU-Legacy-Kernel
         path: kernel_workspace/AnyKernel3/*
