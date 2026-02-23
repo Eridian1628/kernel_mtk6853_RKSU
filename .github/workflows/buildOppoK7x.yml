@@ -70,17 +70,21 @@ jobs:
         find drivers/nfc -name "Kconfig*" -exec dos2unix {} \;
         find drivers/misc -name "Kconfig*" -exec dos2unix {} \;
 
-    - name: 注入 Minimalist Hooks (手动钩子)
+    - name: 注入 Minimalist Hooks (精准修复语法)
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 修改 fs/open.c (务必在函数头下一行插入)
-        sed -i '/long do_sys_open(int/a \
-        extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\nksu_handle_faccessat(&dfd, &filename, &mode, &flags);' fs/open.c
+        # 修复 fs/open.c
+        # 逻辑：先删除之前可能注入错误的行，然后匹配函数头并在紧随其后的左大括号后插入代码
+        sed -i '/ksu_handle_faccessat/d' fs/open.c
+        sed -i '/long do_sys_open(int dfd, const char __user \*filename, int flags, umode_t mode)/!b;n;a \    ksu_handle_faccessat(&dfd, &filename, &mode, &flags);' fs/open.c
+        # 并在文件头部添加声明（如果还没添加的话）
+        sed -i '1i extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);' fs/open.c
 
-        # 修改 fs/exec.c
-        sed -i '/int search_binary_handler(struct/a \
-        extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\nksu_handle_execveat(&bprm->fd, &bprm->filename, &bprm->argc, &bprm->envp, &bprm->flags);' fs/exec.c
+        # 修复 fs/exec.c
+        sed -i '/ksu_handle_execveat/d' fs/exec.c
+        sed -i '/int search_binary_handler(struct linux_binprm \*bprm)/!b;n;a \    ksu_handle_execveat(&bprm->fd, &bprm->filename, &bprm->argc, &bprm->envp, &bprm->flags);' fs/exec.c
+        sed -i '1i extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);' fs/exec.c
 
     - name: 配置内核并开启 KSU
       run: |
