@@ -53,7 +53,7 @@ jobs:
         sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         
         # 克隆 legacy 分支（兼容 4.14）
-        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v1.0.5-83-legacy
         
         # 路径软链接
         ln -sf $(pwd)/drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
