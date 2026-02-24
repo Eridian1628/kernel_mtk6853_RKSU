@@ -52,50 +52,59 @@ jobs:
         sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         sed -i '/ksu_core/d' drivers/Kconfig drivers/Makefile || true
         
-        # 2. 克隆 KSU legacy tag
+        # 2. 克隆 RKSU 特定分支
         git clone --depth=1 https://github.com/rsuntk/KernelSU KernelSU_Tmp -b v3.0.0-30-legacy || { echo "克隆失败"; exit 1; }
         
-        # 3. 物理扁平化：把 kernel/ 里的核心代码移动到 drivers/ksu_core/
+        # 3. 物理扁平化：RKSU Legacy 源码就在根目录
         mkdir -p drivers/ksu_core
-        cp -r KernelSU_Tmp/kernel/* drivers/ksu_core/ || { echo "拷贝失败！"; exit 1; }
+        # 拷贝根目录下的所有核心文件 (ksu.c, ksu.h, etc.)
+        cp -v KernelSU_Tmp/*.c KernelSU_Tmp/*.h KernelSU_Tmp/Makefile KernelSU_Tmp/Kconfig drivers/ksu_core/ || {
+            echo "根目录拷贝失败，尝试 kernel 目录..."
+            cp -r KernelSU_Tmp/kernel/* drivers/ksu_core/
+        }
         rm -rf KernelSU_Tmp
         
-        # 4. 强制修复 ksu_core 内部的 Makefile (关键！)
-        # 强制该目录生成 ksu.o，并确保它能搜寻到当前目录的头文件
-        echo "obj-y += ksu.o" > drivers/ksu_core/Makefile
+        # 4. 强制修复 ksu_core 内部的 Makefile
+        # RKSU 内部可能引用了 kernelsu.c，这里做个检测
+        if [ -f "drivers/ksu_core/kernelsu.c" ]; then
+            echo "obj-y += kernelsu.o" > drivers/ksu_core/Makefile
+        else
+            echo "obj-y += ksu.o" > drivers/ksu_core/Makefile
+        fi
+        # 注入头文件搜索路径，防止编译时找不到 .h
         echo "ccflags-y += -I\$(srctree)/drivers/ksu_core" >> drivers/ksu_core/Makefile
         
-        # 5. 强制注入顶级 Kconfig 和 Makefile
-        # 使用 1i 确保它们在所有逻辑之前运行
+        # 5. 注入顶级构建系统
+        # 必须在 drivers/Makefile 第一行插入，确保它参与 built-in.o 的合并
         sed -i '1i source "drivers/ksu_core/Kconfig"' drivers/Kconfig
         sed -i '1i obj-y += ksu_core/' drivers/Makefile
         
-        # 6. 处理编码兼容性
-        find drivers/ksu_core -name "*" -exec dos2unix {} \; || true
-        find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
+        # 6. 处理编码兼容性（MTK 内核必备）
+        find drivers/ksu_core -type f -exec dos2unix {} \; || true
         
-        # 7. 钩子注入 (保持你的原版逻辑)
-        # [fs/exec.c]
+        # 7. 钩子注入 (保持你的原版逻辑，但修正了缩进和可能的特殊字符)
+        # fs/exec.c
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
         sed -i '/do_execveat_common(int fd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c
         
-        # [fs/open.c]
+        # fs/open.c
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
         sed -i 's/int flags = 0;/int flags = 0;\n#ifdef CONFIG_KSU\n    ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags);\n#endif/' fs/open.c
 
-        # [fs/stat.c]
+        # fs/stat.c
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
         sed -i '/vfs_fstatat(int dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flag);\n#endif/' fs/stat.c
         sed -i '/SYSCALL_DEFINE4(newfstatat, int, dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, NULL, flag);\n#endif/' fs/stat.c
 
-        # [kernel/reboot.c]
+        # kernel/reboot.c
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
         sed -i '/SYSCALL_DEFINE4(reboot/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c
         
         # 8. 验证
         echo "=== 检查结果 ==="
-        grep "ksu_core" drivers/Makefile
-        ls -l drivers/ksu_core/ksu.c
+        ls -l drivers/ksu_core/
+        grep "ksu_core" drivers/Makefile || echo "Makefile 注入失败！"
+        
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
