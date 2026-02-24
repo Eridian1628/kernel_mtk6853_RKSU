@@ -99,22 +99,40 @@ jobs:
         key: mtk6853-new-ksu-minhook-${{ github.sha }}
         max-size: 3G
 
-    - name: 配置内核并开启 KSU
+    - name: 配置内核并开启 KSU（修复 scripts/config 调用）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
 
+        # 生成初始 .config
         make O=out mt6853-ss_defconfig
 
-        scripts/config --file out/.config --enable CONFIG_KSU
-        scripts/config --file out/.config --enable CONFIG_KSU_MANUAL_HOOK
-        scripts/config --file out/.config --disable CONFIG_KSU_USE_KPROBES
-        scripts/config --file out/.config --disable CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_HAVE_KPROBES
-        scripts/config --file out/.config --enable CONFIG_MODULES
+        # 调试：检查 .config 是否生成
+        ls -l out/.config || { echo "ERROR: out/.config not found!"; exit 1; }
+        head -n 20 out/.config  # 打印前20行看是否正常
 
+        # 用 bash 显式调用 scripts/config，一次性设置所有开关
+        bash scripts/config --file out/.config \
+          --enable CONFIG_KSU \
+          --enable CONFIG_KSU_MANUAL_HOOK \
+          --enable CONFIG_MODULES \
+          --disable CONFIG_KSU_USE_KPROBES \
+          --disable CONFIG_KPROBES \
+          --disable CONFIG_KPROBE_EVENTS \
+          --disable CONFIG_HAVE_KPROBES
+
+        # 如果上面失败，再 fallback 单条设置（逐个）
+        # bash scripts/config --file out/.config --enable CONFIG_KSU || echo "Failed to enable CONFIG_KSU"
+        # ... 类似其他
+
+        # 刷新配置 + 调试输出
         make O=out olddefconfig
+        grep -E 'CONFIG_KSU|CONFIG_MODULES|KPROBE' out/.config || echo "KSU config not set! Check scripts/config"
+
+        # 可选：如果还是问题，加 --keep-case
+        # bash scripts/config --keep-case --file out/.config --enable CONFIG_KSU ...
 
     - name: 开始编译内核
       run: |
@@ -157,3 +175,8 @@ jobs:
       with:
         name: MT6853-NewKSU-Image.gz-dtb
         path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
+    - name: 上传 .config 调试
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-config-debug
+        path: kernel_workspace/android-kernel/out/.config
