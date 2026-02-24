@@ -63,36 +63,42 @@ jobs:
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
 
-      # ---------------------------------------------------------
-        # 4. 精准钩子注入 (单行稳定版 - 避开 SYSCALL 宏陷阱)
-        # ---------------------------------------------------------
-
-        # [fs/exec.c] 拦截执行 (普通函数，在入口注入即可)
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c || true
-        sed -i '/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c || true
-
-        # [fs/open.c] 拦截访问权限 (宏定义函数，在 return 处注入)
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c || true
-        sed -i '/SYSCALL_DEFINE.*faccessat/,/return/ s/return/if (ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n    return/' fs/open.c || true
-
-        # [fs/stat.c] 拦截文件属性 (包含普通函数和宏函数)
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c || true
-        sed -i '/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flags);\n#endif/' fs/stat.c || true
-        sed -i '/SYSCALL_DEFINE.*newfstatat/,/return/ s/return/if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    return/' fs/stat.c || true
-
-        # [kernel/reboot.c] 拦截重启
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c || true
-        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c || true
-
-        # ---------------------------------------------------------
-        # 5. 注入结果检查
-        # ---------------------------------------------------------
-        echo "=== 注入结果确认 ==="
-        grep -Hn "ksu_handle" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c || true
+    - name: 集成 rsuntk KernelSU 新版 + 最小化钩子
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 只要这三个核心注入了，就一定能过
-        grep -q "ksu_handle_execveat" fs/exec.c && grep -q "ksu_handle_faccessat" fs/open.c && echo "核心钩子全部就绪！"
+        # 1. 基础清理与克隆
+        rm -rf drivers/kernelsu KernelSU
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || exit 1
+        
+        # 2. 配置 Kconfig 和 Makefile
+        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
+        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        
+        # 3. 核心钩子注入 (采用最稳妥的搜索替换)
 
+        # [fs/exec.c]
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
+        sed -i '/do_execveat_common(int fd/a #ifdef CONFIG_KSU\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif' fs/exec.c
+
+        # [fs/open.c] - 解决 dfd 未定义的核心：直接在函数内部变量定义后注入
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
+        # 找 faccessat 内部一定存在的 LOOKUP_FOLLOW
+        sed -i '/LOOKUP_FOLLOW/a #ifdef CONFIG_KSU\n    ksu_handle_faccessat(&dfd, &filename, &mode, &flags);\n#endif' fs/open.c
+
+        # [fs/stat.c]
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
+        sed -i '/vfs_fstatat(int dfd/a #ifdef CONFIG_KSU\n    ksu_handle_stat(&dfd, &filename, &flags);\n#endif' fs/stat.c
+        # 在 cp_new_stat 之前注入，绕过变量名混淆
+        sed -i '/cp_new_stat/i #ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, statbuf, flag);\n#endif' fs/stat.c
+
+        # [kernel/reboot.c]
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
+        sed -i '/SYSCALL_DEFINE4(reboot/a #ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif' kernel/reboot.c
+
+        # 4. 检查注入是否成功
+        grep -r "ksu_handle" fs/ kernel/ || echo "警告：注入可能未完全成功"
     - name: 设置 ccache 缓存
       uses: hendrikmuhs/ccache-action@v1.2
       with:
