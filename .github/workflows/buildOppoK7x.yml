@@ -48,34 +48,65 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # ... 前面的清理、克隆 v3.0.0-30-legacy、路径链接、pgtable.h 修复、dos2unix 乱码修复 保持不变
+        # 1. 彻底清理旧 KernelSU
+        rm -rf drivers/kernelsu KernelSU
+        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         
-              # 清理旧注入（防止重复）
+        # 2. 克隆最新 legacy tag（新版）
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || { echo "克隆失败，请检查 tag 或网络"; exit 1; }
+        
+        # 3. 软链接
+        ln -sf $(pwd)/drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
+        ln -sf $(pwd)/drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
+        
+        # 4. 注入 Kconfig / Makefile
+        dos2unix drivers/Kconfig || true
+        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        
+        # 5. 修复 pgtable.h（4.14 无此头文件）
+        sed -i '/#include <linux\/pgtable.h>/d' drivers/kernelsu/kp_util.c || true
+        sed -i '1i #include <asm/pgtable.h>' drivers/kernelsu/kp_util.c || true
+        
+        # 6. Oppo 乱码修复
+        find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
+        
+        # 7. 清理所有旧 KSU hook（防重复注入）
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
-
-        # fs/exec.c - 注入到 do_execveat_common 函数体开头（单行写法）
-        sed -i '/int do_execveat_common/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif\n }' fs/exec.c || true
-
-        # fs/open.c - do_faccessat
-        sed -i '/long do_faccessat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(&dfd, &filename, &mode, &flags)) return -EACCES;\n    #endif\n }' fs/open.c || true
-
+        
+        # 8. 最小化钩子注入（Gemini 替换方式 + 单行）
+        # fs/exec.c
+        sed -i '/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c || true
+        
+        # fs/open.c
+        sed -i '/do_faccessat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n#endif/' fs/open.c || true
+        
         # fs/stat.c - vfs_fstatat
-        sed -i '/int vfs_fstatat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif\n }' fs/stat.c || true
-
-        # fs/stat.c - __do_sys_newfstatat（如果存在）
-        sed -i '/int __do_sys_newfstatat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    #endif\n }' fs/stat.c || true
-
-        # kernel/reboot.c - SYSCALL_DEFINE4(reboot)
-        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n    if (ksu_handle_reboot(magic1, magic2, cmd, arg)) return -EINVAL;\n    #endif\n }' kernel/reboot.c || true
-
-        # 统一 extern 声明（放在 fs/exec.c 开头）
+        sed -i '/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(\&dfd, \&filename, \&flags);\n#endif/' fs/stat.c || true
+        
+        # fs/stat.c - __do_sys_newfstatat
+        sed -i '/__do_sys_newfstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    extern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n#endif/' fs/stat.c || true
+        
+        # kernel/reboot.c
+        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    extern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c || true
+        
+        # 9. extern 声明（统一加到 fs/exec.c 开头）
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif\n' fs/exec.c || true
-
-        # 调试：打印注入结果
-        echo "=== fs/exec.c do_execveat_common 附近 ==="
-        grep -A 15 "do_execveat_common" fs/exec.c || echo "未找到 do_execveat_common"
-        echo "=== fs/open.c do_faccessat 附近 ==="
-        grep -A 10 "do_faccessat" fs/open.c || echo "未找到 do_faccessat"
+        
+        # 10. 强力调试：打印所有注入位置 + 行号
+        echo "=== 注入结果检查 ==="
+        echo "fs/exec.c 中 ksu_handle_execveat 出现位置："
+        grep -n "ksu_handle_execveat" fs/exec.c || echo "未找到 execveat hook！"
+        echo -e "\nfs/open.c 中 ksu_handle_faccessat："
+        grep -n "ksu_handle_faccessat" fs/open.c || echo "未找到 faccessat hook！"
+        echo -e "\nfs/stat.c 中 ksu_handle_stat 或 newfstatat："
+        grep -n "ksu_handle_stat\|ksu_handle_newfstatat" fs/stat.c || echo "未找到 stat hook！"
+        echo -e "\nkernel/reboot.c 中 ksu_handle_reboot："
+        grep -n "ksu_handle_reboot" kernel/reboot.c || echo "未找到 reboot hook！"
+        
+        # 如果任意一个 hook 没注入成功，退出报错
+        if ! grep -q "ksu_handle_execveat" fs/exec.c; then echo "ERROR: execveat hook 注入失败！"; exit 1; fi
+        if ! grep -q "ksu_handle_faccessat" fs/open.c; then echo "ERROR: faccessat hook 注入失败！"; exit 1; fi
 
     - name: 设置 ccache 缓存
       uses: hendrikmuhs/ccache-action@v1.2
