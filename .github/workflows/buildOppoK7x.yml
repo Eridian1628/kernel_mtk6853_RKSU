@@ -26,12 +26,12 @@ jobs:
 
     - name: 下载 GCC 工具链 (Google 4.9)
       run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace || mkdir -p $GITHUB_WORKSPACE/kernel_workspace && cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace && cd $GITHUB_WORKSPACE/kernel_workspace
         mkdir -p gcc64 gcc32
         wget -qO gcc-aarch64.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
-        tar -C gcc64/ -xzf gcc-aarch64.tar.gz
+        tar -xzf gcc-aarch64.tar.gz -C gcc64/
         wget -qO gcc-arm.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
-        tar -C gcc32/ -xzf gcc-arm.tar.gz
+        tar -xzf gcc-arm.tar.gz -C gcc32/
 
     - name: 下载 Clang 工具链 (crDroid clang-10)
       run: |
@@ -42,84 +42,69 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
-        cd android-kernel
 
-    - name: 集成 rsuntk KernelSU 新版 + 最小化钩子
+    - name: 集成 rsuntk KernelSU (Legacy) 并注入最小化钩子
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 1. 彻底清理与准备
+        # 1. 彻底清理与源码准备
         rm -rf drivers/kernelsu KernelSU
         sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
-        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || exit 1
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || { echo "KSU 克隆失败"; exit 1; }
         
-        # 2. 链接 Kconfig/Makefile
-        ln -sf $(pwd)/drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
-        ln -sf $(pwd)/drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
+        # 2. 物理拷贝配置（解决链接失效问题）
+        cp drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
+        cp drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
         sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
         echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
         
-        # 3. 修复 Oppo 源码乱码与残留
+        # 3. 清理旧痕迹与 Oppo 源码乱码
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
+        sed -i '/ifdef CONFIG_KSU/,/endif/d' fs/*.c kernel/*.c || true
 
-    - name: 集成 rsuntk KernelSU 新版 + 最小化钩子
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        
-        # 1. 基础清理与克隆
-        rm -rf drivers/kernelsu KernelSU
-        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || exit 1
-        
-        # 2. 配置 Kconfig 和 Makefile
-        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
-        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
-        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-        
-        # 3. 核心钩子注入 (采用最稳妥的搜索替换)
-
+        # 4. 精准钩子注入 (融合版：稳健位置 + 单行语法)
         # [fs/exec.c]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
         sed -i '/do_execveat_common(int fd/a #ifdef CONFIG_KSU\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif' fs/exec.c
 
-        # [fs/open.c] - 解决 dfd 未定义的核心：直接在函数内部变量定义后注入
+        # [fs/open.c] - 解决 dfd 未定义的核心：直接在 LOOKUP_FOLLOW 处注入
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
-        # 找 faccessat 内部一定存在的 LOOKUP_FOLLOW
         sed -i '/LOOKUP_FOLLOW/a #ifdef CONFIG_KSU\n    ksu_handle_faccessat(&dfd, &filename, &mode, &flags);\n#endif' fs/open.c
 
         # [fs/stat.c]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
         sed -i '/vfs_fstatat(int dfd/a #ifdef CONFIG_KSU\n    ksu_handle_stat(&dfd, &filename, &flags);\n#endif' fs/stat.c
-        # 在 cp_new_stat 之前注入，绕过变量名混淆
         sed -i '/cp_new_stat/i #ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, statbuf, flag);\n#endif' fs/stat.c
 
         # [kernel/reboot.c]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
         sed -i '/SYSCALL_DEFINE4(reboot/a #ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif' kernel/reboot.c
 
-        # 4. 检查注入是否成功
-        grep -r "ksu_handle" fs/ kernel/ || echo "警告：注入可能未完全成功"
-    - name: 设置 ccache 缓存
+        # 5. 注入结果强制检查
+        echo "=== 注入结果确认 ==="
+        grep -r "ksu_handle" fs/ kernel/ | grep -v "extern" || true
+        
+        if ! grep -q "ksu_handle_execveat" fs/exec.c; then echo "ERROR: execveat hook 丢失！"; exit 1; fi
+        if ! grep -q "ksu_handle_faccessat" fs/open.c; then echo "ERROR: faccessat hook 丢失！"; exit 1; fi
+        if ! grep -q "ksu_handle_stat" fs/stat.c; then echo "ERROR: stat hook 丢失！"; exit 1; fi
+
+    - name: 设置 ccache 缓存 (优化后的 Key)
       uses: hendrikmuhs/ccache-action@v1.2
       with:
-        key: mtk6853-new-ksu-minhook-${{ github.sha }}
+        key: mtk6853-ksu-v3-legacy # 固定 Key，只在代码变动时更新缓存
         max-size: 3G
 
-    - name: 配置内核并开启 KSU（修复 scripts/config 调用）
+    - name: 配置内核并开启 KSU
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
 
-        # 生成初始 .config
         make O=out mt6853-ss_defconfig
-
-        # 调试：检查 .config 是否生成
-        ls -l out/.config || { echo "ERROR: out/.config not found!"; exit 1; }
-        head -n 20 out/.config  # 打印前20行看是否正常
-
-        # 用 bash 显式调用 scripts/config，一次性设置所有开关
+        
+        # 使用 bash 显式调用脚本
         bash scripts/config --file out/.config \
           --enable CONFIG_KSU \
           --enable CONFIG_KSU_MANUAL_HOOK \
@@ -129,16 +114,8 @@ jobs:
           --disable CONFIG_KPROBE_EVENTS \
           --disable CONFIG_HAVE_KPROBES
 
-        # 如果上面失败，再 fallback 单条设置（逐个）
-        # bash scripts/config --file out/.config --enable CONFIG_KSU || echo "Failed to enable CONFIG_KSU"
-        # ... 类似其他
-
-        # 刷新配置 + 调试输出
         make O=out olddefconfig
-        grep -E 'CONFIG_KSU|CONFIG_MODULES|KPROBE' out/.config || echo "KSU config not set! Check scripts/config"
-
-        # 可选：如果还是问题，加 --keep-case
-        # bash scripts/config --keep-case --file out/.config --enable CONFIG_KSU ...
+        grep -E 'CONFIG_KSU|CONFIG_MODULES' out/.config
 
     - name: 开始编译内核
       run: |
@@ -149,7 +126,6 @@ jobs:
         export KBUILD_BUILD_HOST=coolapk@三笆
         export KBUILD_BUILD_USER=GitHub@sanba0519
 
-        make -s -j$(nproc --all) O=out mt6853-ss_defconfig
         make -j$(nproc --all) O=out \
           CC="ccache clang" \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -161,26 +137,38 @@ jobs:
     - name: 制作 AnyKernel3 卡刷包
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone https://github.com/osm0sis/AnyKernel3
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
         cd AnyKernel3
+        
+        # 1. 强制修正 Boot 分区路径 (针对 Oppo/Realme 标准路径)
+        sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=/dev/block/by-name/boot;|g' anykernel.sh
+        
+        # 2. Only A 设备专属配置
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-        sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=auto;!g' anykernel.sh
-        sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
-        echo 'cmdline+=" androidboot.selinux=permissive"' >> anykernel.sh
-        cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
+        sed -i 's/is_slot_device=0;/is_slot_device=0;/g' anykernel.sh
+        
+        # 3. 注入 SELinux 宽容模式（可选）
+        sed -i '/cmdline=/a cmdline="androidboot.selinux=permissive"' anykernel.sh
+        
+        # 4. 拷贝内核镜像 (优先寻找 Image.gz-dtb)
+        if [ -f "../android-kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
+        elif [ -f "../android-kernel/out/arch/arm64/boot/Image.gz" ]; then
+            cp ../android-kernel/out/arch/arm64/boot/Image.gz Image.gz
+        else
+            echo "ERROR: Kernel image not found!"
+            exit 1
+        fi
+        
+        # 5. 清理不必要的文件
         rm -rf .git* README.md .github
 
     - name: 上传 AnyKernel3 卡刷包
       uses: actions/upload-artifact@v4
       with:
-        name: OPPO-Realme-MT6853-NewKSU-MinHook-AnyKernel3
+        name: OPPO-K7x-MT6853-KSU-OnlyA-AnyKernel3
         path: kernel_workspace/AnyKernel3/*
 
-    - name: 上传原始 Image.gz-dtb
-      uses: actions/upload-artifact@v4
-      with:
-        name: MT6853-NewKSU-Image.gz-dtb
-        path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
     - name: 上传 .config 调试
       uses: actions/upload-artifact@v4
       with:
