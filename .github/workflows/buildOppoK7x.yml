@@ -103,23 +103,35 @@ jobs:
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
         sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d" fs/*.c kernel/*.c || true
         
-        # 9. 注入钩子（动态前缀）
-        # execveat
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/" fs/exec.c || true
-        
-        # faccessat
+        # 9. 注入钩子 (fs/open.c 专项多级探测版 - VSCode 完全兼容)
+
+        # 先统一加 extern 声明（单行写法）
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif" fs/open.c || true
-        sed -i "/sys_faccessat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n#endif/" fs/open.c || true
-        
-        # stat
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ${KSU_PREFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
-        sed -i "/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_stat(\&dfd, \&filename, \&flags);\n#endif/" fs/stat.c || true
-        sed -i "/__do_sys_newfstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n#endif/" fs/stat.c || true
-        
-        # reboot
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif" kernel/reboot.c || true
-        sed -i "/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_reboot(magic1, magic2, cmd, arg);\n#endif/" kernel/reboot.c || true
+
+        # 定义注入代码块（用单行转义，避免多行问题）
+        KSU_HOOK="#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n#endif"
+
+        echo "正在探测 fs/open.c 注入锚点..."
+
+        # 多级锚点探测（每个 sed 独立一行，VSCode 友好）
+        if grep -q "long ret;" fs/open.c; then
+          sed -i "/long ret;/a $KSU_HOOK" fs/open.c || true
+          echo "成功注入锚点：long ret;"
+        elif grep -q "int error;" fs/open.c; then
+          sed -i "/int error;/a $KSU_HOOK" fs/open.c || true
+          echo "成功注入锚点：int error;"
+        elif grep -q "int ret;" fs/open.c; then
+          sed -i "/int ret;/a $KSU_HOOK" fs/open.c || true
+          echo "成功注入锚点：int ret;"
+        else
+          # 兜底：插到第一个 return 前
+          sed -i "/return/i $KSU_HOOK" fs/open.c || true
+          echo "注意：使用了兜底注入方案 (第一个 return 前)"
+        fi
+
+        # 验证注入结果（关键调试）
+        echo "=== fs/open.c 注入位置检查 ==="
+        grep -nC 3 "${KSU_PREFIX}_handle_faccessat" fs/open.c || echo "注入失败！请检查 fs/open.c"
         
         # 10. 最终验证（重点看这里！）
         echo "=== 最终验证 ==="
