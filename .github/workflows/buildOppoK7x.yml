@@ -43,7 +43,7 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
 
-    - name: 集成 rsuntk KernelSU (Legacy) 并注入最小化钩子
+    - name: 集成 rsuntk KernelSU (Legacy) 并注入钩子
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
@@ -52,11 +52,13 @@ jobs:
         sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || { echo "KSU 克隆失败"; exit 1; }
         
-        # 2. 物理拷贝配置
+        # 2. 物理拷贝配置 (rsuntk 结构修复)
         cp drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
         cp drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
+        
+        # 修正 drivers 层级的引用，确保 obj-y 强制进入子目录编译
         sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        sed -i '1i obj-y += kernelsu/' drivers/Makefile
         
         # 3. 清理旧痕迹与源码乱码
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
@@ -73,11 +75,11 @@ jobs:
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
         sed -i 's/int flags = 0;/int flags = 0;\n#ifdef CONFIG_KSU\n    ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags);\n#endif/' fs/open.c
 
-        # [fs/stat.c] - 针对你提供的源码进行了重构
+        # [fs/stat.c]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
-        # 注入 vfs_fstatat (如果源码中有定义)
+        # 针对 vfs_fstatat 的注入 (手动 Hook 模式核心)
         sed -i '/vfs_fstatat(int dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flag);\n#endif/' fs/stat.c
-        # 注入 SYSCALL_DEFINE4(newfstatat) 确保变量作用域正确
+        # 针对 newfstatat 系统调用的注入
         sed -i '/SYSCALL_DEFINE4(newfstatat, int, dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, NULL, flag);\n#endif/' fs/stat.c
 
         # [kernel/reboot.c]
@@ -88,10 +90,10 @@ jobs:
         echo "=== 注入结果确认 ==="
         grep -rn "ksu_handle" fs/ kernel/ | grep -v "extern" || true
 
-    - name: 设置 ccache 缓存 (优化后的 Key)
+    - name: 设置 ccache 缓存
       uses: hendrikmuhs/ccache-action@v1.2
       with:
-        key: mtk6853-ksu-v3-legacy # 固定 Key，只在代码变动时更新缓存
+        key: mtk6853-ksu-v3-legacy
         max-size: 3G
 
     - name: 配置内核并开启 KSU
@@ -103,8 +105,8 @@ jobs:
 
         make O=out mt6853-ss_defconfig
         
-        # 使用 bash 显式调用脚本
-        bash scripts/config --file out/.config \
+        # 使用 scripts/config 强制写入配置，确保 CONFIG_KSU 处于激活状态
+        ./scripts/config --file out/.config \
           --enable CONFIG_KSU \
           --enable CONFIG_KSU_MANUAL_HOOK \
           --enable CONFIG_MODULES \
@@ -114,7 +116,8 @@ jobs:
           --disable CONFIG_HAVE_KPROBES
 
         make O=out olddefconfig
-        grep -E 'CONFIG_KSU|CONFIG_MODULES' out/.config
+        echo "--- 检查最终 KSU 配置 ---"
+        grep "CONFIG_KSU" out/.config
 
     - name: 开始编译内核
       run: |
@@ -122,7 +125,7 @@ jobs:
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
-        export KBUILD_BUILD_HOST=coolapk@三笆
+        export KBUILD_BUILD_HOST=coolapk@sanba
         export KBUILD_BUILD_USER=GitHub@sanba0519
 
         make -j$(nproc --all) O=out \
@@ -138,18 +141,11 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3
         cd AnyKernel3
-        
-        # 1. 强制修正 Boot 分区路径 (针对 Oppo/Realme 标准路径)
         sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=/dev/block/by-name/boot;|g' anykernel.sh
-        
-        # 2. Only A 设备专属配置
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
         sed -i 's/is_slot_device=0;/is_slot_device=0;/g' anykernel.sh
-        
-        # 3. 注入 SELinux 宽容模式（可选）
         sed -i '/cmdline=/a cmdline="androidboot.selinux=permissive"' anykernel.sh
         
-        # 4. 拷贝内核镜像 (优先寻找 Image.gz-dtb)
         if [ -f "../android-kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
             cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
         elif [ -f "../android-kernel/out/arch/arm64/boot/Image.gz" ]; then
@@ -158,18 +154,10 @@ jobs:
             echo "ERROR: Kernel image not found!"
             exit 1
         fi
-        
-        # 5. 清理不必要的文件
         rm -rf .git* README.md .github
 
     - name: 上传 AnyKernel3 卡刷包
       uses: actions/upload-artifact@v4
       with:
-        name: OPPO-K7x-MT6853-KSU-OnlyA-AnyKernel3
+        name: OPPO-K7x-MT6853-KSU-AnyKernel3
         path: kernel_workspace/AnyKernel3/*
-
-    - name: 上传 .config 调试
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-config-debug
-        path: kernel_workspace/android-kernel/out/.config
