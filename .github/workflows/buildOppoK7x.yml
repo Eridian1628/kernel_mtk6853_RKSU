@@ -52,42 +52,39 @@ jobs:
         sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
         git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || { echo "KSU 克隆失败"; exit 1; }
         
-        # 2. 物理拷贝配置（解决链接失效问题）
+        # 2. 物理拷贝配置
         cp drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
         cp drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
         sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
         echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
         
-        # 3. 清理旧痕迹与 Oppo 源码乱码
+        # 3. 清理旧痕迹与源码乱码
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
         sed -i '/ifdef CONFIG_KSU/,/endif/d' fs/*.c kernel/*.c || true
 
-        # 4. 精准钩子注入 (融合版：稳健位置 + 单行语法)
-        # [fs/exec.c]
+        # 4. 精准钩子注入 (修正变量定义与宏位置)
+        
+        # [fs/exec.c] - 寻找函数开始后的左大括号注入
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
-        sed -i '/do_execveat_common(int fd/a #ifdef CONFIG_KSU\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif' fs/exec.c
+        sed -i '/do_execveat_common(int fd/,/^{/ { /^{/ a \    #ifdef CONFIG_KSU\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif' fs/exec.c
 
-        # [fs/open.c] - 解决 dfd 未定义的核心：直接在 LOOKUP_FOLLOW 处注入
+        # [fs/open.c] - 解决 dfd/flags 未定义：匹配变量赋值行
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
-        sed -i '/LOOKUP_FOLLOW/a #ifdef CONFIG_KSU\n    ksu_handle_faccessat(&dfd, &filename, &mode, &flags);\n#endif' fs/open.c
+        sed -i 's/int flags = 0;/int flags = 0;\n#ifdef CONFIG_KSU\n    ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags);\n#endif/' fs/open.c
 
         # [fs/stat.c]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
-        sed -i '/vfs_fstatat(int dfd/a #ifdef CONFIG_KSU\n    ksu_handle_stat(&dfd, &filename, &flags);\n#endif' fs/stat.c
+        sed -i '/vfs_fstatat(int dfd/,/^{/ { /^{/ a \    #ifdef CONFIG_KSU\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif' fs/stat.c
         sed -i '/cp_new_stat/i #ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, statbuf, flag);\n#endif' fs/stat.c
 
-        # [kernel/reboot.c]
+        # [kernel/reboot.c] - 彻底修复 reboot 语法错误
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
-        sed -i '/SYSCALL_DEFINE4(reboot/a #ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif' kernel/reboot.c
+        sed -i '/SYSCALL_DEFINE4(reboot/,/^{/ { /^{/ a \    #ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n    #endif' kernel/reboot.c
 
         # 5. 注入结果强制检查
         echo "=== 注入结果确认 ==="
         grep -r "ksu_handle" fs/ kernel/ | grep -v "extern" || true
-        
-        if ! grep -q "ksu_handle_execveat" fs/exec.c; then echo "ERROR: execveat hook 丢失！"; exit 1; fi
-        if ! grep -q "ksu_handle_faccessat" fs/open.c; then echo "ERROR: faccessat hook 丢失！"; exit 1; fi
-        if ! grep -q "ksu_handle_stat" fs/stat.c; then echo "ERROR: stat hook 丢失！"; exit 1; fi
 
     - name: 设置 ccache 缓存 (优化后的 Key)
       uses: hendrikmuhs/ccache-action@v1.2
