@@ -50,39 +50,29 @@ jobs:
         
         # ... 前面的清理、克隆 v3.0.0-30-legacy、路径链接、pgtable.h 修复、dos2unix 乱码修复 保持不变
         
-        # 清理旧注入（非常重要，防止多次运行积累垃圾代码）
+              # 清理旧注入（防止重复）
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
-        
-        # fs/exec.c - do_execveat_common 函数体开头
-        sed -i '/int do_execveat_common/,/{/ { /{/ a \
-    #ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif
-        }' fs/exec.c || true
-        
-        # fs/open.c - do_faccessat 函数体开头
-        sed -i '/long do_faccessat/,/{/ { /{/ a \
-    #ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(&dfd, &filename, &mode, &flags)) return -EACCES;\n    #endif
-        }' fs/open.c || true
-        
-        # fs/stat.c - vfs_fstatat 函数体开头
-        sed -i '/int vfs_fstatat/,/{/ { /{/ a \
-    #ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif
-        }' fs/stat.c || true
-        
-        # 可选：如果你的 stat 用的是 __do_sys_newfstatat，也加一个
-        sed -i '/int __do_sys_newfstatat/,/{/ { /{/ a \
-    #ifdef CONFIG_KSU\n    extern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    #endif
-        }' fs/stat.c || true
-        
-        # kernel/reboot.c - SYSCALL_DEFINE4(reboot) 函数体开头
-        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ { /{/ a \
-    #ifdef CONFIG_KSU\n    extern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n    if (ksu_handle_reboot(magic1, magic2, cmd, arg)) return -EINVAL;\n    #endif
-        }' kernel/reboot.c || true
-        
-        # 统一在 fs/exec.c 开头加 extern 声明（避免重复声明警告）
+
+        # fs/exec.c - 注入到 do_execveat_common 函数体开头（单行写法）
+        sed -i '/int do_execveat_common/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif\n }' fs/exec.c || true
+
+        # fs/open.c - do_faccessat
+        sed -i '/long do_faccessat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(&dfd, &filename, &mode, &flags)) return -EACCES;\n    #endif\n }' fs/open.c || true
+
+        # fs/stat.c - vfs_fstatat
+        sed -i '/int vfs_fstatat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif\n }' fs/stat.c || true
+
+        # fs/stat.c - __do_sys_newfstatat（如果存在）
+        sed -i '/int __do_sys_newfstatat/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    #endif\n }' fs/stat.c || true
+
+        # kernel/reboot.c - SYSCALL_DEFINE4(reboot)
+        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ { /{/ a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n    if (ksu_handle_reboot(magic1, magic2, cmd, arg)) return -EINVAL;\n    #endif\n }' kernel/reboot.c || true
+
+        # 统一 extern 声明（放在 fs/exec.c 开头）
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif\n' fs/exec.c || true
-        
-        # 调试：打印注入后的代码片段，看看是否正确插入到 { 后面
-        echo "=== fs/exec.c do_execveat_common 附近代码 ==="
+
+        # 调试：打印注入结果
+        echo "=== fs/exec.c do_execveat_common 附近 ==="
         grep -A 15 "do_execveat_common" fs/exec.c || echo "未找到 do_execveat_common"
         echo "=== fs/open.c do_faccessat 附近 ==="
         grep -A 10 "do_faccessat" fs/open.c || echo "未找到 do_faccessat"
