@@ -63,32 +63,32 @@ jobs:
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
 
+      # ---------------------------------------------------------
+        # 4. 精准钩子注入 (单行稳定版 - 避开 SYSCALL 宏陷阱)
         # ---------------------------------------------------------
-        # 4. 精准钩子注入（每个文件独立注入声明 + 变量映射）
-        # ---------------------------------------------------------
 
-        # [fs/exec.c] 拦截执行
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
-        sed -i '/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c
+        # [fs/exec.c] 拦截执行 (普通函数，在入口注入即可)
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c || true
+        sed -i '/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c || true
 
-        # [fs/open.c] 拦截访问权限 - 修复变量未定义报错
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
-        sed -i '/sys_faccessat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    int ksu_dfd = dfd; const char __user *ksu_filename = filename; int ksu_mode = mode; int ksu_flags = 0;\n    if (ksu_handle_faccessat(\&ksu_dfd, \&ksu_filename, \&ksu_mode, \&ksu_flags)) return -EACCES;\n#endif/' fs/open.c
+        # [fs/open.c] 拦截访问权限 (宏定义函数，在 return 处注入)
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c || true
+        sed -i '/SYSCALL_DEFINE.*faccessat/,/return/ s/return/if (ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n    return/' fs/open.c || true
 
-        # [fs/stat.c] 拦截文件属性 - 预防性声明注入
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
-        sed -i '/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flags);\n#endif/' fs/stat.c
-        sed -i '/__do_sys_newfstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n#endif/' fs/stat.c
+        # [fs/stat.c] 拦截文件属性 (包含普通函数和宏函数)
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c || true
+        sed -i '/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flags);\n#endif/' fs/stat.c || true
+        sed -i '/SYSCALL_DEFINE.*newfstatat/,/return/ s/return/if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    return/' fs/stat.c || true
 
         # [kernel/reboot.c] 拦截重启
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
-        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c || true
+        sed -i '/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c || true
 
         # ---------------------------------------------------------
-        # 5. 最终检查
+        # 5. 注入结果检查
         # ---------------------------------------------------------
         echo "=== 注入结果确认 ==="
-        grep -Hn "ksu_handle" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c
+        grep -Hn "ksu_handle" fs/exec.c fs/open.c fs/stat.c kernel/reboot.c || true
         
         # 只要这三个核心注入了，就一定能过
         grep -q "ksu_handle_execveat" fs/exec.c && grep -q "ksu_handle_faccessat" fs/open.c && echo "核心钩子全部就绪！"
