@@ -43,68 +43,77 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
 
-    - name: 集成 rsuntk KernelSU 并注入钩子
+        - name: 集成 rsuntk KernelSU 并注入钩子
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 1. 彻底清理旧残留
+        # 1. 彻底清理
         rm -rf drivers/kernelsu KernelSU drivers/ksu_core KernelSU_Tmp
-        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
-        sed -i '/ksu_core/d' drivers/Kconfig drivers/Makefile || true
+        sed -i '/kernelsu/d;/ksu_core/d;/KSU/d' drivers/Kconfig drivers/Makefile || true
         
-        # 2. 克隆 RKSU 特定分支
+        # 2. 克隆 Legacy 分支
         git clone --depth=1 https://github.com/rsuntk/KernelSU KernelSU_Tmp -b v3.0.0-30-legacy || { echo "克隆失败"; exit 1; }
         
-        # 3. 物理扁平化：RKSU Legacy 源码就在根目录
+        # 3. 物理扁平化（递归拷贝所有文件，兼容任意结构）
         mkdir -p drivers/ksu_core
-        # 拷贝根目录下的所有核心文件 (ksu.c, ksu.h, etc.)
-        cp -v KernelSU_Tmp/*.c KernelSU_Tmp/*.h KernelSU_Tmp/Makefile KernelSU_Tmp/Kconfig drivers/ksu_core/ || {
-            echo "根目录拷贝失败，尝试 kernel 目录..."
-            cp -r KernelSU_Tmp/kernel/* drivers/ksu_core/
-        }
+        cp -r KernelSU_Tmp/* drivers/ksu_core/ || { echo "拷贝失败，请检查仓库结构"; exit 1; }
         rm -rf KernelSU_Tmp
         
-        # 4. 强制修复 ksu_core 内部的 Makefile
-        # RKSU 内部可能引用了 kernelsu.c，这里做个检测
-        if [ -f "drivers/ksu_core/kernelsu.c" ]; then
-            echo "obj-y += kernelsu.o" > drivers/ksu_core/Makefile
+        # 4. 自动检测函数名前缀（多关键词判断）
+        cd drivers/ksu_core
+        if grep -q -e "rksu_handle_execveat" -e "rksu_handle_" *.c *.h 2>/dev/null; then
+          KSU_PREFIX="rksu"
+        elif grep -q -e "ksu_handle_execveat" -e "ksu_handle_" *.c *.h 2>/dev/null; then
+          KSU_PREFIX="ksu"
         else
-            echo "obj-y += ksu.o" > drivers/ksu_core/Makefile
+          KSU_PREFIX="ksu"
+          echo "WARNING: 未检测到 handle_ 前缀，使用默认 ksu_"
         fi
-        # 注入头文件搜索路径，防止编译时找不到 .h
+        cd ../../
+        echo "检测到的 KSU 前缀：${KSU_PREFIX}_handle_"
+        
+        # 5. 强制重写 ksu_core/Makefile（确保能编译）
+        if [ -f "drivers/ksu_core/kernelsu.c" ]; then
+          echo "obj-y += kernelsu.o" > drivers/ksu_core/Makefile
+        else
+          echo "obj-y += ksu.o" > drivers/ksu_core/Makefile
+        fi
         echo "ccflags-y += -I\$(srctree)/drivers/ksu_core" >> drivers/ksu_core/Makefile
         
-        # 5. 注入顶级构建系统
-        # 必须在 drivers/Makefile 第一行插入，确保它参与 built-in.o 的合并
+        # 6. 注入 Kconfig 和 Makefile（顶级）
         sed -i '1i source "drivers/ksu_core/Kconfig"' drivers/Kconfig
         sed -i '1i obj-y += ksu_core/' drivers/Makefile
         
-        # 6. 处理编码兼容性（MTK 内核必备）
+        # 7. 处理编码 + 清理旧痕迹
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
+        sed -i "/${KSU_PREFIX}_handle/d" fs/*.c kernel/*.c || true
+        sed -i "/ksu_handle/d;/rksu_handle/d" fs/*.c kernel/*.c || true
         
-        # 7. 钩子注入 (保持你的原版逻辑，但修正了缩进和可能的特殊字符)
-        # fs/exec.c
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
-        sed -i '/do_execveat_common(int fd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c
+        # 8. 注入钩子（动态前缀）
+        # execveat
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
+        sed -i "/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/" fs/exec.c || true
         
-        # fs/open.c
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
-        sed -i 's/int flags = 0;/int flags = 0;\n#ifdef CONFIG_KSU\n    ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags);\n#endif/' fs/open.c
+        # faccessat
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif" fs/open.c || true
+        sed -i "/sys_faccessat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode, \&flags)) return -EACCES;\n#endif/" fs/open.c || true
+        
+        # stat
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ${KSU_PREFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
+        sed -i "/vfs_fstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_stat(\&dfd, \&filename, \&flags);\n#endif/" fs/stat.c || true
+        sed -i "/__do_sys_newfstatat/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n#endif/" fs/stat.c || true
+        
+        # reboot
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif" kernel/reboot.c || true
+        sed -i "/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_reboot(magic1, magic2, cmd, arg);\n#endif/" kernel/reboot.c || true
+        
+        # 9. 最终验证（看这里！）
+        echo "=== 最终验证 ==="
+        echo "KSU 前缀：${KSU_PREFIX}"
+        grep -r "${KSU_PREFIX}_handle" fs/ kernel/ || echo "未找到注入！"
+        ls -l drivers/ksu_core/*.c drivers/ksu_core/*.h || echo "源码文件缺失！"
+        head -n 5 drivers/ksu_core/Makefile
 
-        # fs/stat.c
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif' fs/stat.c
-        sed -i '/vfs_fstatat(int dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_stat(\&dfd, \&filename, \&flag);\n#endif/' fs/stat.c
-        sed -i '/SYSCALL_DEFINE4(newfstatat, int, dfd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_newfstatat(dfd, filename, NULL, flag);\n#endif/' fs/stat.c
-
-        # kernel/reboot.c
-        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
-        sed -i '/SYSCALL_DEFINE4(reboot/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c
-        
-        # 8. 验证
-        echo "=== 检查结果 ==="
-        ls -l drivers/ksu_core/
-        grep "ksu_core" drivers/Makefile || echo "Makefile 注入失败！"
-        
     - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
