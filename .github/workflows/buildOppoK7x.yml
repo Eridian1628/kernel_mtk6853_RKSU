@@ -4,7 +4,7 @@ on:
   push:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 5' # 每周五凌晨运行一次
+    - cron: '0 0 * * 5'
 
 jobs:
   build:
@@ -43,26 +43,34 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
 
-    - name: 集成 rsuntk KernelSU (Legacy) 并注入钩子
+    - name: 集成 rsuntk KernelSU 并注入钩子
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         
-        # 1. 环境清理与克隆
+        # 1. 彻底准备目录结构
         rm -rf drivers/kernelsu KernelSU
-        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy || { echo "KSU 克隆失败"; exit 1; }
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy
         
-        # 2. 注入 Kconfig (在最前面 source 确保优先级)
-        sed -i '1i source "drivers/kernelsu/kernel/Kconfig"' drivers/Kconfig
+        # [关键修复]：rsuntk legacy 的文件都在 kernel/ 目录下，我们需要把它们移出来或者建立软链接
+        # 这里采用物理移动方案，确保 Kconfig 就在 drivers/kernelsu/ 目录下
+        cd drivers/kernelsu
+        cp kernel/Kconfig .
+        cp kernel/Makefile .
+        cd ../..
+        
+        # 2. 注入 Kconfig 和 Makefile
+        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
+        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        sed -i '1i obj-y += kernelsu/' drivers/Makefile
 
-        # 3. 清理旧痕迹
+        # 3. 源码清理与钩子注入
         find drivers/soc/oplus drivers/nfc drivers/misc -name "Kconfig*" -exec dos2unix {} \; || true
         sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
-        sed -i '/ifdef CONFIG_KSU/,/endif/d' fs/*.c kernel/*.c || true
-
-        # 4. 钩子注入 (精准匹配逻辑)
+        
+        # [注入钩子逻辑]
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif' fs/exec.c
         sed -i '/do_execveat_common(int fd/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/' fs/exec.c
-
+        
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n#endif' fs/open.c
         sed -i 's/int flags = 0;/int flags = 0;\n#ifdef CONFIG_KSU\n    ksu_handle_faccessat(\&dfd, \&filename, \&mode, \&flags);\n#endif/' fs/open.c
 
@@ -73,14 +81,13 @@ jobs:
         sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif' kernel/reboot.c
         sed -i '/SYSCALL_DEFINE4(reboot/,/^{/ s/^{/{\n#ifdef CONFIG_KSU\n    ksu_handle_reboot(magic1, magic2, cmd, arg);\n#endif/' kernel/reboot.c
 
-
-    - name: 设置 ccache 缓存
+    - name: 设置 ccache
       uses: hendrikmuhs/ccache-action@v1.2
       with:
         key: mtk6853-ksu-v3-legacy
         max-size: 3G
 
-    - name: 配置内核并开启 KSU (强制注入版)
+    - name: 配置内核并开启 KSU
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
@@ -89,7 +96,7 @@ jobs:
 
         make O=out mt6853-ss_defconfig
         
-        # 强制开启配置
+        # 开启 KSU
         ./scripts/config --file out/.config \
           --enable CONFIG_KSU \
           --enable CONFIG_KSU_MANUAL_HOOK \
@@ -100,16 +107,6 @@ jobs:
           --disable CONFIG_HAVE_KPROBES
 
         make O=out olddefconfig
-
-        # 【核心修正】在 defconfig 和 olddefconfig 运行完之后，强制修改 Makefile
-        # 我们跳过 kernelsu 的外层，直接让驱动目录编译内核核心代码所在目录
-        sed -i '1i obj-y += kernelsu/kernel/' drivers/Makefile
-        
-        # 调试信息打印
-        echo "=== 检查 Makefile 第一行 ==="
-        head -n 1 drivers/Makefile
-        echo "=== 检查 KSU 源码是否存在 ==="
-        ls -l drivers/kernelsu/kernel/Makefile
 
     - name: 开始编译内核
       run: |
