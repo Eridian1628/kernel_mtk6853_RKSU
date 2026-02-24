@@ -44,18 +44,77 @@ jobs:
         git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
         cd android-kernel
 
-    - name: 集成 rsuntk KernelSU (legacy v1.0.5-83 稳定版)
+    - name: 集成 rsuntk KernelSU 新版 + 最小化钩子
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        rm -rf KernelSU
-        # 用 rsuntk fork 的 setup.sh + 指定 legacy tag（兼容 4.14 manual hook）
-        curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh" | bash -s v3.0.0-30-legacy
+        
+        # 清理旧 KSU
+        rm -rf drivers/kernelsu KernelSU
+        sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
+        
+        # 克隆最新 legacy tag（新版，支持 4.14 manual hook）
+        git clone --depth=1 https://github.com/rsuntk/KernelSU drivers/kernelsu -b v3.0.0-30-legacy
+        
+        # 路径修复
+        ln -sf $(pwd)/drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
+        ln -sf $(pwd)/drivers/kernelsu/kernel/Makefile drivers/kernelsu/Makefile
+        
+        # 注入 Kconfig/Makefile
+        dos2unix drivers/Kconfig
+        sed -i '1i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+        echo "obj-\$(CONFIG_KSU) += kernelsu/" >> drivers/Makefile
+        
+        # 修复 pgtable.h 不存在（新版代码常见坑）
+        sed -i '/#include <linux\/pgtable.h>/d' drivers/kernelsu/kp_util.c || true
+        sed -i '1i #include <asm/pgtable.h>' drivers/kernelsu/kp_util.c || true
+        
+        # 加入 backslashxx 最小化钩子（从 issue #5 参考，针对 4.14 优化）
+        sed -i '/ksu_handle/d' fs/*.c kernel/*.c || true
+        
+        # execveat (do_execveat_common)
+        sed -i '/int do_execveat_common(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n    ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n    #endif' fs/exec.c
+        
+        # faccessat
+        sed -i '/long do_faccessat(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\n    if (ksu_handle_faccessat(&dfd, &filename, &mode, &flags)) return -EACCES;\n    #endif' fs/open.c
+        
+        # newfstatat / vfs_fstatat (关键，解决 manager 不认 apk)
+        sed -i '/int __do_sys_newfstatat(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n    if (ksu_handle_newfstatat(dfd, filename, statbuf, flag)) return -EACCES;\n    #endif' fs/stat.c || true
+        
+        sed -i '/int vfs_fstatat(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\n    ksu_handle_stat(&dfd, &filename, &flags);\n    #endif' fs/stat.c || true
+        
+        # reboot hook (可选，防止重启绕过)
+        sed -i '/int kernel_reboot(/!b;n;a \    #ifdef CONFIG_KSU\n    extern int ksu_handle_reboot(int magic, int cmd);\n    if (ksu_handle_reboot(magic, cmd)) return -EINVAL;\n    #endif' kernel/reboot.c || true
+        
+        # 头部声明（放 fs/exec.c）
+        sed -i '1i #ifdef CONFIG_KSU\nextern int ksu_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);\nextern int ksu_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\nextern int ksu_handle_stat(int *dfd, const char __user **filename, int *flags);\nextern int ksu_handle_reboot(int magic, int cmd);\n#endif' fs/exec.c
+        
+        # Oppo 乱码修复
+        find drivers/soc/oplus -name "Kconfig*" -exec dos2unix {} \;
+        find drivers/nfc -name "Kconfig*" -exec dos2unix {} \;
+        find drivers/misc -name "Kconfig*" -exec dos2unix {} \;
 
     - name: 设置 ccache 缓存
       uses: hendrikmuhs/ccache-action@v1.2
       with:
-        key: mtk6853-ksu-nethunter-${{ github.sha }}
+        key: mtk6853-new-ksu-minhook-${{ github.sha }}
         max-size: 3G
+
+    - name: 配置内核并开启 KSU
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+
+        make O=out mt6853-ss_defconfig
+
+        scripts/config --file out/.config --enable CONFIG_KSU
+        scripts/config --file out/.config --enable CONFIG_KSU_MANUAL_HOOK
+        scripts/config --file out/.config --disable CONFIG_KSU_USE_KPROBES
+        scripts/config --file out/.config --disable CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_HAVE_KPROBES
+        scripts/config --file out/.config --enable CONFIG_MODULES
+
+        make O=out olddefconfig
 
     - name: 开始编译内核
       run: |
@@ -63,8 +122,8 @@ jobs:
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc64/bin:$GITHUB_WORKSPACE/kernel_workspace/gcc32/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
-        export KBUILD_BUILD_HOST=企鹅交流:722651738
-        export KBUILD_BUILD_USER=kuan-jsbsbxjxh66
+        export KBUILD_BUILD_HOST=coolapk@三笆
+        export KBUILD_BUILD_USER=GitHub@sanba0519
 
         make -s -j$(nproc --all) O=out mt6853-ss_defconfig
         make -j$(nproc --all) O=out \
@@ -83,18 +142,18 @@ jobs:
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
         sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=auto;!g' anykernel.sh
         sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
-        echo 'cmdline+=" androidboot.selinux=permissive"' >> anykernel.sh  # 兼容 SELinux
+        echo 'cmdline+=" androidboot.selinux=permissive"' >> anykernel.sh
         cp ../android-kernel/out/arch/arm64/boot/Image.gz-dtb Image.gz-dtb
-        rm -rf .git* README.md .github  # 清理多余文件
+        rm -rf .git* README.md .github
 
     - name: 上传 AnyKernel3 卡刷包
       uses: actions/upload-artifact@v4
       with:
-        name: OPPO-Realme-MT6853-KSU-AnyKernel3
+        name: OPPO-Realme-MT6853-NewKSU-MinHook-AnyKernel3
         path: kernel_workspace/AnyKernel3/*
 
     - name: 上传原始 Image.gz-dtb
       uses: actions/upload-artifact@v4
       with:
-        name: MT6853-Image.gz-dtb
+        name: MT6853-NewKSU-Image.gz-dtb
         path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
