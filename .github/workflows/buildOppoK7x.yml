@@ -104,43 +104,43 @@ jobs:
 
         # 9. 注入钩子
 
-        # 先全局清理旧痕迹，防止残留导致链接失败
-        sed -i "/_handle_execveat/d;/_handle_faccessat/d;/_handle_stat/d;/_handle_newfstatat/d;/_handle_reboot/d;/KSU/d" fs/*.c kernel/*.c || true
+        # 先全局清理旧痕迹，避免重复注入导致混乱
+        sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
 
-        # 自动检测实际前缀（去 drivers/ksu_core 里搜）
-        if grep -q "rksu_handle_execveat" drivers/ksu_core/*.c drivers/ksu_core/*.h 2>/dev/null; then
-          PFIX="rksu"
-        else
-          PFIX="ksu"
-        fi
-        echo "KSU_LOG: 检测到实际函数前缀为 ${PFIX}"
+        # --- execveat：精准锁定 do_execveat_common 函数体内 ---
+        # 声明 extern
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
 
-        # execveat - 插在 int retval; 后
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/int retval;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif" fs/exec.c || true
+        # 只在 do_execveat_common 函数里找 int retval; 并插入
+        sed -i "/static int do_execveat_common/,/return/ {/int retval;/a \#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif\n}" fs/exec.c || true
 
-        # faccessat - 3 参数版
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode);\n#endif" fs/open.c || true
-        sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n    if (${PFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
+        # --- open.c：faccessat 3 参数版 ---
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode);\n#endif" fs/open.c || true
+        sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
 
-        # stat - flag 单数版
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename, int *flag);\nextern int ${PFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
+        # --- stat.c：flag 单数版 ---
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_stat(int *dfd, const char __user **filename, int *flag);\nextern int ${KSU_PREFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
 
-        KSU_STAT_HOOK="#ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(\&dfd, \&filename, \&flag);\n#endif"
-        KSU_NEWFSTATAT_HOOK="#ifdef CONFIG_KSU\n    if (${PFIX}_handle_newfstatat(dfd, filename, (struct stat *)statbuf, flag)) return -EACCES;\n#endif"
+        KSU_STAT_HOOK="#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_stat(\&dfd, \&filename, \&flag);\n#endif"
+        KSU_NEWFSTATAT_HOOK="#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_newfstatat(dfd, filename, (struct stat *)statbuf, flag)) return -EACCES;\n#endif"
 
         sed -i "/SYSCALL_DEFINE4(newfstatat/,/int error;/ {/int error;/a $KSU_STAT_HOOK\n    $KSU_NEWFSTATAT_HOOK\n}" fs/stat.c || true
         sed -i "/COMPAT_SYSCALL_DEFINE4(newfstatat/,/int error;/ {/int error;/a $KSU_STAT_HOOK\n    $KSU_NEWFSTATAT_HOOK\n}" fs/stat.c || true
 
-        # reboot - 用检测到的前缀
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif" kernel/reboot.c || true
-        sed -i "/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${PFIX}_handle_reboot(magic1, magic2, cmd, arg);\n#endif/" kernel/reboot.c || true
+        # --- reboot.c ---
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif" kernel/reboot.c || true
+        sed -i "/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_reboot(magic1, magic2, cmd, arg);\n#endif/" kernel/reboot.c || true
 
-        # 最终检查符号是否真的存在
-        echo "KSU_LOG: 检查 reboot 钩子函数是否存在"
-        grep -r "handle_reboot" drivers/ksu_core/ || echo "警告：reboot 钩子函数没找到！可能是源码里没有实现"
+        # 调试输出：看看 execveat 到底插在哪
+        echo "注入调试日志："
+        echo "execveat（正常只出现一次，且在 int retval; 附近）："
+        grep -nC 5 "${KSU_PREFIX}_handle_execveat" fs/exec.c || echo "execveat 没注入成功"
+        echo "faccessat："
+        grep -nC 5 "${KSU_PREFIX}_handle_faccessat" fs/open.c || echo "faccessat 没注入成功"
+        echo "stat："
+        grep -nC 5 "${KSU_PREFIX}_handle_stat" fs/stat.c || echo "stat 没注入成功"
+        grep -nC 5 "${KSU_PREFIX}_handle_newfstatat" fs/stat.c || echo "newfstatat 没注入成功"
 
-        echo "KSU_LOG: 注入完成，开始链接阶段"
 
         # 10. 最终验证
         echo "=== 最终验证 ==="
