@@ -101,55 +101,54 @@ jobs:
         # 8. 清理编码 + 旧痕迹（全局清理一次）
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
         sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
+        # 9. 注入钩子（RKSU Patch 风格 + 最终防错版）
 
-        # 9. 注入钩子（RKSU Patch 风格 + fs/read_write 修复版）
-
-        # 自动检测前缀
-        if grep -q "rksu_handle_execveat" drivers/ksu_core/*.c drivers/ksu_core/*.h 2>/dev/null; then
+        # 自动检测前缀（扩大搜索范围，防止路径差异）
+        if grep -r "rksu_handle_execveat" drivers/ 2>/dev/null | grep -q ".c:"; then
           PFIX="rksu"
         else
           PFIX="ksu"
         fi
-        echo "KSU_LOG: 检测到前缀为 ${PFIX}"
+        echo "KSU_LOG: 检测到 RKSU 前缀为 ${PFIX}"
 
-        # 全局清理旧痕迹
-        sed -i "/${PFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
+        # 全局清理旧痕迹（覆盖所有可能文件）
+        sed -i "/${PFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c fs/read_write.c drivers/input/input.c || true
 
-        # faccessat（3 参数版，保持稳定）
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode);\n#endif" fs/open.c || true
-        sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n    if (${PFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
+        # faccessat（4 参数，锚点改到 lookup_flags 后，防作用域问题）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif" fs/open.c || true
+        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif" fs/open.c || true
 
-        # execveat（保持之前稳定位置）
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/int retval;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif" fs/exec.c || true
+        # execveat（范围锁定 do_execveat_common，防重复 + undeclared）
+        sed -i "1i #ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\nextern int ${PFIX}_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
+        sed -i "/do_execveat_common(int fd/,/int retval;/ {/int retval;/a \#ifdef CONFIG_KSU\n	if (unlikely(ksu_execveat_hook))\n		${PFIX}_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n	else\n		${PFIX}_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n}" fs/exec.c || true
 
-        # stat（flag 单数版）
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename, int *flag);\nextern int ${PFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
+        # stat（lookup_flags 锚点）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif" fs/stat.c || true
+        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(&dfd, &filename, &lookup_flags);\n#endif" fs/stat.c || true
 
-        KSU_STAT_HOOK="#ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(\&dfd, \&filename, \&flag);\n#endif"
-        KSU_NEWFSTATAT_HOOK="#ifdef CONFIG_KSU\n    if (${PFIX}_handle_newfstatat(dfd, filename, (struct stat *)statbuf, flag)) return -EACCES;\n#endif"
-
-        sed -i "/SYSCALL_DEFINE4(newfstatat/,/int error;/ {/int error;/a $KSU_STAT_HOOK\n    $KSU_NEWFSTATAT_HOOK\n}" fs/stat.c || true
-        sed -i "/COMPAT_SYSCALL_DEFINE4(newfstatat/,/int error;/ {/int error;/a $KSU_STAT_HOOK\n    $KSU_NEWFSTATAT_HOOK\n}" fs/stat.c || true
-
-        # fs/read_write.c - RKSU vfs_read 钩子（Gemini 优化版）
-        # 引入头文件（解决 bool/size_t/loff_t 未定义）
+        # vfs_read（头文件先行 + ret 后注入，防类型/变量未定义）
         sed -i "1i #ifdef CONFIG_KSU\n#include <linux/types.h>\n#include <linux/fs.h>\n#endif" fs/read_write.c || true
-
-        # 声明 extern
         sed -i "5i #ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ${PFIX}_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif" fs/read_write.c || true
 
-        # new_sync_read 注入（ret 后）
-        sed -i "/new_sync_read/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook)) ${PFIX}_handle_vfs_read(&filp, &buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
+        sed -i "/new_sync_read/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(&filp, &buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
+        sed -i "/new_sync_write/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(&filp, (char __user **)&buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
 
-        # new_sync_write 注入（const buf 需要强制转换）
-        sed -i "/new_sync_write/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook)) ${PFIX}_handle_vfs_read(&filp, (char __user **)&buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
+        # reboot（加 (void __user **)&arg 转换，防类型问题）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif" kernel/reboot.c || true
+        sed -i "/int ret = 0;/a \#ifdef CONFIG_KSU\n	${PFIX}_handle_sys_reboot(magic1, magic2, cmd, (void __user **)&arg);\n#endif" kernel/reboot.c || true
 
-        # do_iter_readv_writev 注入（如果有）
-        sed -i "/do_iter_readv_writev/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook)) ${PFIX}_handle_vfs_read(&filp, (char __user **)&iter->iov->iov_base, &iter->count, &iter->pos);\n#endif\n}" fs/read_write.c || true
-
-        # reboot - 继续跳过
-        echo "KSU_LOG: reboot 钩子未实现，已跳过"
+        # 注入完成报告（最关键，看这里确认是否成功）
+        echo "KSU_LOG: 注入完成，报告如下："
+        echo "execveat:"
+        grep -nC 5 "${PFIX}_handle_execveat" fs/exec.c || echo "execveat 未注入成功"
+        echo "faccessat:"
+        grep -nC 5 "${PFIX}_handle_faccessat" fs/open.c || echo "faccessat 未注入成功"
+        echo "stat:"
+        grep -nC 5 "${PFIX}_handle_stat" fs/stat.c || echo "stat 未注入成功"
+        echo "vfs_read:"
+        grep -nC 5 "${PFIX}_handle_vfs_read" fs/read_write.c || echo "vfs_read 未注入成功"
+        echo "reboot:"
+        grep -nC 3 "${PFIX}_handle_sys_reboot" kernel/reboot.c || echo "reboot 未注入成功"
 
         # 注入检查报告
         echo "注入报告："
