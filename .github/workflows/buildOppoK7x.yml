@@ -101,33 +101,27 @@ jobs:
         # 8. 清理编码 + 旧痕迹（全局清理一次）
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
         sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
-        
-        # 9. 注入钩子（全适配你的源码）
+         # 9. 注入钩子
 
-        # execveat（保持原样，已验证通过）
+        # 清理所有旧 KSU 痕迹（全局一次，防止重复）
+        sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
+
+        # --- fs/exec.c 适配（do_execveat_common 用 int retval; 锚点） ---
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/do_execveat_common/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif/" fs/exec.c || true
+        # 注入到 int retval; 之后（参数已声明）
+        sed -i "/int retval;/a \#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif" fs/exec.c || true
 
-        # faccessat（你的 3 参数版本，无 flags）
+        # --- fs/open.c 适配（3 参数版本，无 flags） ---
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode);\n#endif" fs/open.c || true
         sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
-        
-        # 兜底 faccessat（如果锚点没匹配）
+        # 兜底（如果锚点没匹配）
         if ! grep -q "${KSU_PREFIX}_handle_faccessat" fs/open.c; then
           sed -i "/return/i \#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
         fi
-        
-        echo "=== fs/open.c faccessat 注入检查 ==="
-        grep -nC 5 "${KSU_PREFIX}_handle_faccessat" fs/open.c || echo "faccessat 注入失败！"
 
-        # stat（匹配你的 flag 单数 + int error; 锚点）
-        # 先彻底清理 stat.c 旧痕迹
-        sed -i '/ksu_handle_stat/d;/ksu_handle_newfstatat/d;/KSU/d' fs/stat.c || true
-        
-        # 只加一次 extern（flag 单数）
+        # --- fs/stat.c 适配（flag 单数 + int error; 锚点） ---
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_stat(int *dfd, const char __user **filename, int *flag);\nextern int ${KSU_PREFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
 
-        # stat 注入代码块
         KSU_STAT_HOOK="#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_stat(\&dfd, \&filename, \&flag);\n#endif"
         KSU_NEWFSTATAT_HOOK="#ifdef CONFIG_KSU\n    if (${KSU_PREFIX}_handle_newfstatat(dfd, filename, (struct stat *)statbuf, flag)) return -EACCES;\n#endif"
 
@@ -137,15 +131,19 @@ jobs:
         # 注入到 COMPAT_SYSCALL_DEFINE4(newfstatat) 的 int error; 后
         sed -i "/COMPAT_SYSCALL_DEFINE4(newfstatat/,/int error;/ {/int error;/a $KSU_STAT_HOOK\n    $KSU_NEWFSTATAT_HOOK\n}" fs/stat.c || true
 
-        # 验证 stat 注入
-        echo "=== fs/stat.c 注入结果确认 ==="
-        grep -nC 5 "${KSU_PREFIX}_handle_stat" fs/stat.c || echo "stat 注入失败！"
-        grep -nC 5 "${KSU_PREFIX}_handle_newfstatat" fs/stat.c || echo "newfstatat 注入失败！"
-        grep -n "int error" fs/stat.c || echo "未找到 int error; 锚点"
-
-        # reboot（保持原样）
+        # --- kernel/reboot.c 适配 ---
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${KSU_PREFIX}_handle_reboot(int magic1, int magic2, unsigned int cmd, void __user *arg);\n#endif" kernel/reboot.c || true
         sed -i "/SYSCALL_DEFINE4(reboot/,/{/ s/{/{\n#ifdef CONFIG_KSU\n    ${KSU_PREFIX}_handle_reboot(magic1, magic2, cmd, arg);\n#endif/" kernel/reboot.c || true
+
+        # 调试输出（看注入是否成功）
+        echo "=== 注入调试日志 ==="
+        echo "execveat 检查："
+        grep -nC 3 "${KSU_PREFIX}_handle_execveat" fs/exec.c || echo "execveat 失败！"
+        echo "faccessat 检查："
+        grep -nC 3 "${KSU_PREFIX}_handle_faccessat" fs/open.c || echo "faccessat 失败！"
+        echo "stat 检查："
+        grep -nC 5 "${KSU_PREFIX}_handle_stat" fs/stat.c || echo "stat 失败！"
+        grep -nC 5 "${KSU_PREFIX}_handle_newfstatat" fs/stat.c || echo "newfstatat 失败！"
 
         # 10. 最终验证
         echo "=== 最终验证 ==="
