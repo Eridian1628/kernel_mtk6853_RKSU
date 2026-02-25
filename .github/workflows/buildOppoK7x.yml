@@ -102,40 +102,42 @@ jobs:
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
         sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
 
-        # 9. 注入钩子
+         # 9. 注入钩子（严格按照 RKSU 作者 Patch 方式）
 
-        # 自动检测前缀
+        # 自动检测前缀（Patch 里常用 ksu_ 或 rksu_）
         if grep -q "rksu_handle_execveat" drivers/ksu_core/*.c drivers/ksu_core/*.h 2>/dev/null; then
           PFIX="rksu"
         else
           PFIX="ksu"
         fi
-        echo "KSU_LOG: 检测到函数前缀为 ${PFIX}"
+        echo "KSU_LOG: 检测到 RKSU 前缀为 ${PFIX}"
 
-        # 全局清理旧痕迹
-        sed -i "/${PFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
+        # 2. 全局清理所有旧注入痕迹
+        sed -i "/${PFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c drivers/input/input.c fs/read_write.c || true
 
-        # execveat - 锁定 do_execveat_common 函数体内
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/static int do_execveat_common/,/return/ {/int retval;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif\n}" fs/exec.c || true
+        # 3. faccessat（Patch 里是 4 参数，插在 prepare_creds() 后）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif" fs/open.c || true
+        sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n	${PFIX}_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif" fs/open.c || true
 
-        # faccessat - 3 参数版
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename, int *mode);\n#endif" fs/open.c || true
-        sed -i "/override_cred = prepare_creds();/a \#ifdef CONFIG_KSU\n    if (${PFIX}_handle_faccessat(\&dfd, \&filename, \&mode)) return -EACCES;\n#endif" fs/open.c || true
+        # 4. execveat（Patch 里带 sucompat 分支，插在 retval 前）
+        sed -i "1i #ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\nextern int ${PFIX}_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
+        sed -i "/int retval;/a \#ifdef CONFIG_KSU\n	if (unlikely(ksu_execveat_hook))\n		${PFIX}_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n	else\n		${PFIX}_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif" fs/exec.c || true
 
-        # stat - flag 单数版，合并注入
-        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename, int *flag);\nextern int ${PFIX}_handle_newfstatat(int dfd, const char __user *filename, struct stat *statbuf, int flag);\n#endif" fs/stat.c || true
-        
-        KSU_STAT_BLOCK="#ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(\&dfd, \&filename, \&flag);\n    if (${PFIX}_handle_newfstatat(dfd, filename, (struct stat *)statbuf, flag)) return -EACCES;\n#endif"
-        
-        sed -i "/newfstatat/,/int error;/ {/int error;/a $KSU_STAT_BLOCK\n}" fs/stat.c || true
+        # 5. stat / newfstatat（Patch 里插在 vfs_fstatat 前）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif" fs/stat.c || true
+        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \#ifdef CONFIG_KSU\n	${PFIX}_handle_stat(&dfd, &filename, &lookup_flags);\n#endif" fs/stat.c || true
 
-        # reboot - 跳过（源码没实现）
-        echo "KSU_LOG: reboot 钩子在驱动中未实现，已跳过注入"
+        # 6. vfs_read（Patch 里特有，RKSU 隐藏核心）
+        sed -i "1i #ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ${PFIX}_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif" fs/read_write.c || true
+        sed -i "/ssize_t ret;/a \#ifdef CONFIG_KSU\n	if (unlikely(ksu_vfs_read_hook))\n		${PFIX}_handle_vfs_read(&file, &buf, &count, &pos);\n#endif" fs/read_write.c || true
 
-        # 最终校验输出（最关键，看看有没有成功注入）
-        echo "KSU_LOG: 正在生成注入报告..."
-        grep -n "${PFIX}_handle" fs/exec.c fs/open.c fs/stat.c || echo "错误：没有任何钩子被成功注入！"
+        # 7. reboot（Patch 里叫 sys_reboot，插在 ret = 0 前）
+        sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif" kernel/reboot.c || true
+        sed -i "/int ret = 0;/a \#ifdef CONFIG_KSU\n	${PFIX}_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif" kernel/reboot.c || true
+
+        # 8. 注入完成报告（看日志确认是否成功）
+        echo "KSU_LOG: 注入完成，报告如下："
+        grep -n "${PFIX}_handle" fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/reboot.c || echo "警告：部分钩子未注入成功！"
 
         # 10. 最终验证
         echo "=== 最终验证 ==="
