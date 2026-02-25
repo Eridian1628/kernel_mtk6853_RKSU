@@ -101,66 +101,56 @@ jobs:
         # 8. 清理编码 + 旧痕迹（全局清理一次）
         find drivers/ksu_core -type f -exec dos2unix {} \; || true
         sed -i "/${KSU_PREFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c || true
-        # 9. 注入钩子（RKSU Patch 风格 + 最终防错版）
 
-        # 自动检测前缀（扩大搜索范围，防止路径差异）
+        # 9. 注入钩子（RKSU Patch 风格 + 语法防错版）
+
+        # 自动检测前缀
         if grep -r "rksu_handle_execveat" drivers/ 2>/dev/null | grep -q ".c:"; then
           PFIX="rksu"
         else
           PFIX="ksu"
         fi
-        echo "KSU_LOG: 检测到 RKSU 前缀为 ${PFIX}"
+        echo "KSU_LOG: 检测到前缀为 ${PFIX}"
 
-        # 全局清理旧痕迹（覆盖所有可能文件）
+        # 清理旧痕迹
         sed -i "/${PFIX}_handle/d;/ksu_handle/d;/rksu_handle/d;/KSU/d" fs/*.c kernel/*.c fs/read_write.c drivers/input/input.c || true
 
-        # faccessat（4 参数，锚点改到 lookup_flags 后，防作用域问题）
+        # faccessat - 插在 prepare_creds() 后（最稳锚点）
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif" fs/open.c || true
-        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif" fs/open.c || true
+        sed -i "/override_cred = prepare_creds();/a #ifdef CONFIG_KSU\n    ${PFIX}_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\n#endif" fs/open.c || true
 
-        # execveat（范围锁定 do_execveat_common，防重复 + undeclared）
+        # execveat - 简化锚点：插在 retval 声明后（加范围防重复）
         sed -i "1i #ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ${PFIX}_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\nextern int ${PFIX}_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif" fs/exec.c || true
-        sed -i "/do_execveat_common(int fd/,/int retval;/ {/int retval;/a \#ifdef CONFIG_KSU\n	if (unlikely(ksu_execveat_hook))\n		${PFIX}_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n	else\n		${PFIX}_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n}" fs/exec.c || true
+        sed -i "/do_execveat_common(/,/int retval;/ {/int retval;/a #ifdef CONFIG_KSU\n    if (unlikely(ksu_execveat_hook))\n        ${PFIX}_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n    else\n        ${PFIX}_handle_execveat_sucompat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif\n}" fs/exec.c || true
 
-        # stat（lookup_flags 锚点）
+        # stat - 插在 lookup_flags 前
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif" fs/stat.c || true
-        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a \#ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(&dfd, &filename, &lookup_flags);\n#endif" fs/stat.c || true
+        sed -i "/unsigned int lookup_flags = LOOKUP_FOLLOW;/a #ifdef CONFIG_KSU\n    ${PFIX}_handle_stat(\&dfd, \&filename, \&lookup_flags);\n#endif" fs/stat.c || true
 
-        # vfs_read（头文件先行 + ret 后注入，防类型/变量未定义）
+        # vfs_read - 保持 Gemini 版（已修复）
         sed -i "1i #ifdef CONFIG_KSU\n#include <linux/types.h>\n#include <linux/fs.h>\n#endif" fs/read_write.c || true
         sed -i "5i #ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ${PFIX}_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif" fs/read_write.c || true
 
-        sed -i "/new_sync_read/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(&filp, &buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
-        sed -i "/new_sync_write/,/ssize_t ret;/ {/ssize_t ret;/a \#ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(&filp, (char __user **)&buf, &len, &ppos);\n#endif\n}" fs/read_write.c || true
+        sed -i "/new_sync_read/,/ssize_t ret;/ {/ssize_t ret;/a #ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(\&filp, \&buf, \&len, \&ppos);\n#endif\n}" fs/read_write.c || true
 
-        # reboot（加 (void __user **)&arg 转换，防类型问题）
+        sed -i "/new_sync_write/,/ssize_t ret;/ {/ssize_t ret;/a #ifdef CONFIG_KSU\n    if (unlikely(ksu_vfs_read_hook))\n        ${PFIX}_handle_vfs_read(\&filp, (char __user **)\&buf, \&len, \&ppos);\n#endif\n}" fs/read_write.c || true
+
+        # reboot - 用 Patch 名字
         sed -i "1i #ifdef CONFIG_KSU\nextern int ${PFIX}_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif" kernel/reboot.c || true
-        sed -i "/int ret = 0;/a \#ifdef CONFIG_KSU\n	${PFIX}_handle_sys_reboot(magic1, magic2, cmd, (void __user **)&arg);\n#endif" kernel/reboot.c || true
+        sed -i "/int ret = 0;/a #ifdef CONFIG_KSU\n    ${PFIX}_handle_sys_reboot(magic1, magic2, cmd, (void __user **)\&arg);\n#endif" kernel/reboot.c || true
 
-        # 注入完成报告（最关键，看这里确认是否成功）
-        echo "KSU_LOG: 注入完成，报告如下："
-        echo "execveat:"
-        grep -nC 5 "${PFIX}_handle_execveat" fs/exec.c || echo "execveat 未注入成功"
-        echo "faccessat:"
-        grep -nC 5 "${PFIX}_handle_faccessat" fs/open.c || echo "faccessat 未注入成功"
-        echo "stat:"
-        grep -nC 5 "${PFIX}_handle_stat" fs/stat.c || echo "stat 未注入成功"
-        echo "vfs_read:"
-        grep -nC 5 "${PFIX}_handle_vfs_read" fs/read_write.c || echo "vfs_read 未注入成功"
-        echo "reboot:"
-        grep -nC 3 "${PFIX}_handle_sys_reboot" kernel/reboot.c || echo "reboot 未注入成功"
-
-        # 注入检查报告
+        # 最终报告
         echo "注入报告："
-        echo "vfs_read 钩子："
-        grep -nC 5 "${PFIX}_handle_vfs_read" fs/read_write.c || echo "vfs_read 未注入成功"
-        echo "execveat："
-        grep -nC 3 "${PFIX}_handle_execveat" fs/exec.c || echo "execveat 未注入"
-        echo "faccessat："
-        grep -nC 3 "${PFIX}_handle_faccessat" fs/open.c || echo "faccessat 未注入"
-        echo "stat："
-        grep -nC 3 "${PFIX}_handle_stat" fs/stat.c || echo "stat 未注入"
-
+        echo "execveat:"
+        grep -nC 5 "${PFIX}_handle_execveat" fs/exec.c || echo "execveat 未注入"
+        echo "faccessat:"
+        grep -nC 5 "${PFIX}_handle_faccessat" fs/open.c || echo "faccessat 未注入"
+        echo "stat:"
+        grep -nC 5 "${PFIX}_handle_stat" fs/stat.c || echo "stat 未注入"
+        echo "vfs_read:"
+        grep -nC 5 "${PFIX}_handle_vfs_read" fs/read_write.c || echo "vfs_read 未注入"
+        echo "reboot:"
+        grep -nC 3 "${PFIX}_handle_sys_reboot" kernel/reboot.c || echo "reboot 未注入"
         # 10. 最终验证
         echo "=== 最终验证 ==="
         echo "KSU 前缀：${KSU_PREFIX}"
