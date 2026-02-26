@@ -41,7 +41,7 @@ jobs:
     - name: 下载内核源码
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone --depth=1 https://github.com/wu17481748/android_kernel_mtk6853 android-kernel
+        git clone --depth=1 https://github.com/Eridian1628/kernel_mtk6853_RKSU android-kernel
 
     - name: 集成 rsuntk KernelSU 并注入钩子
       run: |
