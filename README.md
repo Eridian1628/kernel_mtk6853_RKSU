@@ -1,4 +1,4 @@
-# [Sanba's](https://github.com/sanba0519) fork  [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/oppok7x)
+# [Sanba's](https://github.com/sanba0519) Kernel  [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/oppok7x) [![Build(rsuntk KSU legacy + Hooks) Oppo K7x MT6853](https://github.com/Eridian1628/kernel_mtk6853_RKSU/actions/workflows/buildOppoK7x.yml/badge.svg?event=success)](https://github.com/Eridian1628/kernel_mtk6853_RKSU/actions/workflows/buildOppoK7x.yml)
 OPPO/Realme通用内核
 
 *适用:*
