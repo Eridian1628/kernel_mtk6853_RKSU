@@ -26,18 +26,12 @@ jobs:
 
     - name: 下载 GCC 工具链 (Google 4.9)
       run: |
-         mkdir -p $GITHUB_WORKSPACE/kernel_workspace && cd $GITHUB_WORKSPACE/kernel_workspace
-         mkdir -p gcc64 gcc32
-    
-         # aarch64
-         wget -qO gcc-aarch64.tar.gz https://mirrors.tuna.tsinghua.edu.cn/android-releases/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz || \
-         wget -qO gcc-aarch64.tar.gz https://sourceforge.net/projects/android-releases/files/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz/download || { echo "aarch64 下载失败"; exit 1; }
-         tar -xzf gcc-aarch64.tar.gz -C gcc64/
-    
-         # arm
-         wget -qO gcc-arm.tar.gz https://mirrors.tuna.tsinghua.edu.cn/android-releases/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz || \
-         wget -qO gcc-arm.tar.gz https://sourceforge.net/projects/android-releases/files/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz/download || { echo "arm 下载失败"; exit 1; }
-         tar -xzf gcc-arm.tar.gz -C gcc32/
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace && cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir -p gcc64 gcc32
+        wget -qO gcc-aarch64.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -xzf gcc-aarch64.tar.gz -C gcc64/
+        wget -qO gcc-arm.tar.gz https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz
+        tar -xzf gcc-arm.tar.gz -C gcc32/
 
     - name: 下载 Clang 工具链 (crDroid clang-10)
       run: |
