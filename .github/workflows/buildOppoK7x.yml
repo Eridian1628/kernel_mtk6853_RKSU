@@ -3,8 +3,12 @@ name: Build(rsuntk KSU legacy + Hooks) Oppo K7x MT6853
 on:
   push:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 5'
+    inputs:
+      BBR:
+        type: boolean
+        description: "是否启用 BBR 加速（不了解请不要启用）"
+        required: false
+        default: false
 
 jobs:
   build:
@@ -143,6 +147,16 @@ jobs:
           --disable CONFIG_HAVE_KPROBES
 
         make O=out olddefconfig
+
+        if [ "${{ github.event.inputs.BBR }}" = "true" ]; then
+          echo "启用 BBR..."
+          ./scripts/config --file out/.config \
+            --enable CONFIG_TCP_CONG_BBR \
+            --enable CONFIG_NET_SCH_FQ
+          make O=out olddefconfig
+        else
+          echo "不启用 BBR..."
+        fi
 
     - name: 开始编译内核
       run: |
